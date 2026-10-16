@@ -192,11 +192,25 @@ class MossImageModel(BaseModel):
             _is_hub_repo(base) and base != COMFY_REPO
         ):
             source = base
-        # the tokenizer's declared class: AutoTokenizer also resolves a
-        # config.json the folder lacks, which fails offline
-        return Qwen35TextOnlyEncoder._local_first(
+        tokenizer = Qwen35TextOnlyEncoder._local_first(
             Qwen2Tokenizer.from_pretrained, source, subfolder="tokenizer"
         )
+
+        # MOSS ships without a chat_template; fall back to official Qwen3.5
+        if not getattr(tokenizer, "chat_template", None):
+            try:
+                from transformers import AutoTokenizer
+                official = AutoTokenizer.from_pretrained(
+                    "Qwen/Qwen3.5-9B", trust_remote_code=True
+                )
+                tokenizer.chat_template = official.chat_template
+                self.print_and_status_update(
+                    "Applied official Qwen3.5 chat template (MOSS tokenizer missing one)"
+                )
+            except Exception as e:
+                self.print_and_status_update(f"Warning: could not load official chat template: {e}")
+
+        return tokenizer
 
     def _load_vae(self) -> AutoEncoder:
         self.print_and_status_update("Loading VAE")
@@ -323,20 +337,38 @@ class MossImageModel(BaseModel):
         # one unpadded forward per prompt, like the vendor (padding would leak
         # into the gated-delta recurrence)
         for text in prompt:
+            # unconditional path passes "" — give the template something non-empty
+            content = text if text and text.strip() else " "
             formatted = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": text}],
+                [{"role": "user", "content": content}],
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=True,
             )
-            input_ids = self.tokenizer(
+            tok = self.tokenizer(
                 formatted,
                 return_tensors="pt",
                 truncation=True,
                 max_length=self.max_text_length,
-            )["input_ids"].to(self.device_torch)
-            out = self.text_encoder(input_ids=input_ids, use_cache=False)
+            )
+            input_ids = tok["input_ids"].to(self.device_torch)
+            attention_mask = tok.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device_torch)
+
+            # last-resort guard in case the template still collapses to nothing
+            if input_ids.shape[-1] == 0:
+                eos = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+                input_ids = torch.tensor([[eos]], device=self.device_torch, dtype=input_ids.dtype)
+                attention_mask = torch.ones_like(input_ids)
+
+            out = self.text_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
             embeds.append(out.last_hidden_state[0].to(self.torch_dtype))
+
         return AdvancedPromptEmbeds(text_embeds=embeds)
 
     def get_loss_target(self, *args, **kwargs):
